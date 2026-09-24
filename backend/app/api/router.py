@@ -5,7 +5,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import HangRail, RailPlacement, Store, WorkOrder
+from app.gateway import placement_gateway
+from app.models.models import HangRail, Store, WorkOrder
 from app.schemas.schemas import (
     HangRequest,
     OccupancyOut,
@@ -15,7 +16,7 @@ from app.schemas.schemas import (
     RailOut,
     StoreOut,
 )
-from app.services.rail_engine import Segment, first_fit
+from app.services.rail_engine import first_fit
 
 api_router = APIRouter()
 
@@ -45,9 +46,7 @@ def occupancy(rail_id: int, db: Session = Depends(get_db)):
     rail = db.get(HangRail, rail_id)
     if not rail:
         raise HTTPException(404, "挂杆不存在")
-    placements = db.scalars(
-        select(RailPlacement).where(RailPlacement.rail_id == rail_id, RailPlacement.active == 1)
-    ).all()
+    placements = placement_gateway.list_active_segments(db, rail_id)
     segs = []
     for p in placements:
         order = db.get(WorkOrder, p.order_id)
@@ -81,20 +80,17 @@ def hang(body: HangRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, "无可用挂杆")
 
     for rail in rails:
-        active = db.scalars(
-            select(RailPlacement).where(RailPlacement.rail_id == rail.id, RailPlacement.active == 1)
-        ).all()
-        occupied = [Segment(p.start_cm, p.end_cm) for p in active]
+        active = placement_gateway.list_active_segments(db, rail.id)
+        occupied = [seg.to_engine_segment() for seg in active]
         place = first_fit(rail.length_cm, occupied, order.length_cm)
         if place is None:
             continue
-        db.add(
-            RailPlacement(
-                rail_id=rail.id,
-                order_id=order.id,
-                start_cm=place.start_cm,
-                end_cm=place.end_cm,
-            )
+        placement_gateway.write_placement(
+            db,
+            rail_id=rail.id,
+            order_id=order.id,
+            start_cm=place.start_cm,
+            end_cm=place.end_cm,
         )
         order.status = "hung"
         order.hung_at = datetime.utcnow()
@@ -112,11 +108,7 @@ def pickup(body: PickupRequest, db: Session = Depends(get_db)):
         raise HTTPException(404, "取件码无效")
     if order.status != "hung":
         raise HTTPException(400, "工单未在挂杆上")
-    placements = db.scalars(
-        select(RailPlacement).where(RailPlacement.order_id == order.id, RailPlacement.active == 1)
-    ).all()
-    for p in placements:
-        p.active = 0
+    placement_gateway.release_placements(db, order.id)
     order.status = "picked"
     db.commit()
     db.refresh(order)
